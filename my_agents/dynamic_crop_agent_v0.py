@@ -3,7 +3,7 @@ from typing import Optional
 from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, ANIMALS, MARKET_PARAMS
 
 
-TASK_PRIORITY = {"harvest": 0, "water": 1,  "plant": 2, "weed": 3, }
+TASK_PRIORITY = {"critical_water": 0, "harvest": 1, "water": 2,  "plant": 3, "weed": 4, }
 NAME = "dynamic_crop_agent"
 
 def agent(obs):
@@ -116,9 +116,13 @@ def _choose_crop_to_plant(ctx):
 
 def _crops_available_to_plant(ctx):
     # Only consider crops that can be planted and harvested before the end of the episode and only crops that we can afford to buy seeds for.
-
     crops_available = [crop for crop in CROPS.keys() if ctx.day + _days_to_max_unfertilized_yield(crop) < 30 
                        and ctx.me["money"] >= CROPS[crop]["seed"]*6]
+
+    # If day == 0, remove melons, because they take too long to grow for intial day. 
+    # This is a hack to avoid planting melons on day 0, which would be a bad strategy.
+    if ctx.day == 0 and "MELON" in crops_available:
+        crops_available.remove("MELON")
 
     return crops_available
 
@@ -165,8 +169,12 @@ def _find_tasks(ctx, crop_to_plant):
             elif kind == "PLANT":
 
                 if not tile["watered_today"]:
-                    tasks.append(
-                        Task(type="water", x=x, y=y, crop=tile["crop"], tile=tile) )
+                    if tile["consecutive_unwatered"] >= 1:
+                        water_type = "critical_water"
+                    else:
+                        water_type = "water"
+
+                    tasks.append(Task(type=water_type, x=x, y=y, crop=tile["crop"], tile=tile,))
 
                 # Discovery exposes harvesting as an option.
                 # Strategy decides whether we actually want it.
@@ -192,9 +200,21 @@ def _assign_tasks(ctx, tasks):
     assignments = []
 
     for worker_position in workers:
-        worker_tasks = [task for task in available_tasks if (task.type != "plant" or available_seeds.get(task.crop, 0) > 0)]
+        fx, fy = worker_position
+        critical_here = next((task for task in available_tasks
+                              if task.type == "critical_water"
+                              and (task.x, task.y) == (fx, fy)), 
+                              None,)
 
-        task = _choose_task(ctx, worker_position, worker_tasks)
+        if critical_here is not None:
+            task = critical_here
+        else:
+            worker_tasks = [task for task in available_tasks
+                            if (task.type != "plant" 
+                                or available_seeds.get(task.crop, 0) > 0)]
+
+            task = _choose_task(ctx, worker_position, worker_tasks)
+
         assignments.append(task)
 
         if task is None:
@@ -230,7 +250,7 @@ def _task_is_desirable(ctx, task):
 
     if task.type == "plant":
         # Plant if it is not the end of the day (hour < 23). 
-        return ctx.hour < 23
+        return ctx.hour < 21
 
     return True
 
@@ -262,9 +282,10 @@ def _task_action(task):
     if task.type == "plant":
         return ["PLANT", task.crop]
 
-    actions = { "water": ["WATER"],
+    actions = {"critical_water": ["WATER"],
+               "water": ["WATER"],
                "harvest": ["HARVEST"],
-                 "weed": ["DIG"],}
+               "weed": ["DIG"],}
 
     return actions[task.type]
 
@@ -293,7 +314,7 @@ def _market_actions(ctx, crop_to_plant):
     seeds = ctx.private["seeds"].get(crop_to_plant, 0)
 
     money_available = ctx.me["money"]
-    target_hires = 6
+    target_hires = 5
     hires_needed = target_hires - ctx.me["hires_today"]
 
     for i in range(hires_needed):
@@ -306,11 +327,11 @@ def _market_actions(ctx, crop_to_plant):
         else:
             break
 
-    # If I have no seeds and enough money, buy 5 seeds of the crop to plant.
+    # If I have no seeds and enough money, buy 4 seeds of the crop to plant.
     if crop_to_plant is not None:
-        seed_cost = CROPS[crop_to_plant]["seed"] * 5
+        seed_cost = CROPS[crop_to_plant]["seed"] * 4
         if seeds <= 2 and money_available >= seed_cost:
-            actions.append(["BUY_SEED", crop_to_plant, 5])
+            actions.append(["BUY_SEED", crop_to_plant, 4])
             money_available -= seed_cost
 
     for crop_in_shed, inventory in ctx.private["shed"].items():
@@ -319,7 +340,7 @@ def _market_actions(ctx, crop_to_plant):
 
 
     # If more than 70% of the land is occupied and I have enough money, buy more land.
-    if _land_occupied_percentage(ctx) > 70 and money_available >= 1000 * 1.6:
+    if _land_occupied_percentage(ctx) > 70 and money_available >= 1000 * 1.7:
         actions.append(["BUY_LAND"])    
         money_available -= 1000
 
