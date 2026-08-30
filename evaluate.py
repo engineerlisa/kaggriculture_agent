@@ -1,5 +1,6 @@
-from my_agents.carrot_agent import agent
+from my_agents.dynamic_crop_agent import agent
 from kaggle_environments import make
+from pprint import pprint
 
 env = make("kaggriculture",
            configuration={"episodeSteps": 720,
@@ -7,6 +8,7 @@ env = make("kaggriculture",
                           debug=True,)
 
 steps = env.run([agent, "starter",])
+pprint(steps)
 
 
 # from eval import evaluate_and_log
