@@ -1,4 +1,4 @@
-from my_agents.dynamic_crop_agent import agent
+from my_agents.dynamic_crop_agent_v0 import agent
 from kaggle_environments import make
 from pprint import pprint
 
