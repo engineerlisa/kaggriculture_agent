@@ -1,5 +1,11 @@
 .venv/
+.vscode/
 __pycache__/
+evaluations/
+.archive/
 *.pyc
 *.csv
 KAGGRICULTURE_README.md
+*.gz
+main.py
+.gitignore

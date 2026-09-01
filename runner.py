@@ -1,0 +1,42 @@
+from agent_framework import (
+    Plan,
+    assign_tasks,
+    build_context,
+    execute_assignments,
+    generate_candidate_tasks,
+)
+from policies import heuristic_v1
+
+
+DEFAULT_POLICY = heuristic_v1
+
+
+def run_agent(obs, policy=DEFAULT_POLICY):
+    """Run one turn with a swappable decision policy.
+
+    Required policy functions:
+      select_crop(ctx)
+      select_animal(ctx, crop_to_plant)
+      is_terminal_liquidation(ctx)
+      rank_task(ctx, worker_index, worker_position, task)
+      market_actions(ctx, plan, assignments)
+    """
+    ctx = build_context(obs)
+
+    crop_to_plant = policy.select_crop(ctx)
+    animal_to_add = policy.select_animal(ctx, crop_to_plant)
+    plan = Plan(
+        crop_to_plant=crop_to_plant,
+        animal_to_add=animal_to_add,
+        terminal_liquidation=policy.is_terminal_liquidation(ctx),
+    )
+
+    tasks = generate_candidate_tasks(ctx, plan)
+    assignments = assign_tasks(ctx, tasks, policy.rank_task)
+    farmer_action, hand_actions = execute_assignments(ctx, assignments)
+
+    return {
+        "farmer": farmer_action,
+        "hands": hand_actions,
+        "market": policy.market_actions(ctx, plan, assignments),
+    }

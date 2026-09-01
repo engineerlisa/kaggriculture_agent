@@ -1,152 +1,122 @@
-# Kaggriculture Agent
+# Kaggriculture baseline refactor
 
-Heuristic agent development for Kaggle's **Kaggriculture** competition.
+This is a behavior-preserving structural refactor of `dynamic_all_agent_v1.py`.
+The goal is not to make the heuristic smarter. The goal is to make the
+heuristic one replaceable policy on top of stable game/assignment plumbing.
 
-## Development Approach
+## Structure
 
-The agent is being built incrementally, with an emphasis on understanding the game mechanics and validating one strategy change at a time through local simulation.
+```text
+main.py
+runner.py
+agent_framework/
+    core.py
+    tasks.py
+policies/
+    heuristic_v1.py
+behavior_check.py
+static_equivalence_check.py
+```
 
-Each meaningful strategy change is preserved as a new agent iteration so that it can be evaluated against earlier baselines rather than overwritten.
+### `agent_framework/core.py`
 
-The current architecture separates the agent into:
+Owns state and hard facts that should not be relearned by a model:
 
-1. **Context** — extracts relevant state from the observation.
-2. **Task discovery** — identifies possible actions such as planting, watering, harvesting, and clearing weeds.
-3. **Strategy** — determines which tasks are desirable and prioritizes them.
-4. **Task assignment** — assigns work across the farmer and hired hands while avoiding duplicate tile assignments.
-5. **Execution** — moves workers toward assigned tasks and performs actions.
-6. **Market policy** — handles seed purchases, crop sales, hiring, and land expansion.
+- `Context`, `Task`, and `Plan`
+- observation parsing
+- geometry and shed access
+- worker inventory and task feasibility
+- seed/resource bookkeeping helpers
+- end-of-day overflow calculation
+- basic crop/animal state helpers
 
-## Agent Iterations
+### `agent_framework/tasks.py`
 
-### `agent_v1`
+Owns the stable worker-action pipeline:
 
-Initial minimal wheat agent.
+1. generate candidate tasks for the selected plan
+2. reject mechanically infeasible worker/task pairs
+3. ask the policy to rank remaining pairs
+4. enforce one worker per task tile and seed reservation
+5. convert assignments into Kaggriculture actions
 
-* Operates only on the farmer's current tile.
-* Buys one wheat seed when out of seeds.
-* Plants wheat on an empty tile.
-* Waters and harvests planted wheat.
-* Sells harvested wheat.
+The framework does **not** decide whether harvesting, collecting fertilizer,
+or planting is economically desirable. Those are policy decisions.
 
-### `agent_v2`
+### `policies/heuristic_v1.py`
 
-First correction to the basic crop lifecycle logic.
+Contains the current baseline's actual opinions:
 
-* Prioritizes watering before harvesting.
-* Delays wheat harvest relative to `agent_v1`.
-* Keeps the intentionally simple single-tile strategy.
+- crop revenue/value estimates and crop selection
+- animal revenue/value estimates and animal selection
+- harvest rules and fertilizer collection threshold
+- task priority/ranking
+- hiring, buying, selling, feed reserve, and land-purchase rules
+- terminal-liquidation timing
 
-### `agent_v3`
+This file intentionally preserves existing hacks and thresholds so the
+structural refactor can be evaluated independently of strategy changes.
 
-Introduces the first general task-based architecture.
+### `runner.py`
 
-* Adds `Context` and `Task` data structures.
-* Scans the farm to discover planting, watering, harvesting, and weed-clearing tasks.
-* Moves the farmer toward tasks instead of acting only on the current tile.
-* Separates task discovery, strategy, execution, and market policy.
-* Uses task priority first and distance second when choosing work.
+Connects a policy to the framework. The default is `policies.heuristic_v1`.
+A replacement policy only needs these functions:
 
-### `agent_v4`
+```python
+select_crop(ctx)
+select_animal(ctx, crop_to_plant)
+is_terminal_liquidation(ctx)
+rank_task(ctx, worker_index, worker_position, task)
+market_actions(ctx, plan, assignments)
+```
 
-Extends the task architecture to multiple workers.
+That supports several useful experimental surfaces without forcing an
+end-to-end learned agent through the framework:
 
-* Assigns tasks to both the farmer and hired hands.
-* Prevents multiple workers from being assigned to the same tile.
-* Reserves seeds during assignment so workers cannot over-allocate planting tasks.
-* Adds worker hiring.
-* Avoids planting at the very end of the day.
-* Uses crop yield rather than only crop age as the harvest trigger.
+- replace crop/animal selection or valuation with model inference
+- replace worker/task ranking with a learned utility model
+- replace the market policy independently
+- keep the heuristic policy as the adversarial baseline
 
-### `wheat_agent`
+An end-to-end RL policy can still bypass this architecture entirely.
 
-Establishes a more complete single-crop wheat baseline.
+## Validation
 
-* Uses game crop parameters when deciding when wheat is mature.
-* Hires multiple hands to increase available labor.
-* Buys seeds in larger batches.
-* Adds price-aware crop selling.
-* Adds land expansion when unlocked land becomes sufficiently occupied.
-* Generalizes several crop-specific helpers while still planting only wheat.
+`static_equivalence_check.py` injects a small Kaggriculture API stub and
+compares the original and refactored agents over synthetic observations.
+It is useful in environments where `kaggle_environments` is not installed.
 
-### `carrot_agent`
+```bash
+python static_equivalence_check.py --original /path/to/dynamic_all_agent_v1.py
+```
 
-Creates a carrot-specific comparison agent using the same task architecture.
+`behavior_check.py` is the stronger check. Run it in the existing
+Kaggriculture development environment to compare complete episodes against the
+original agent from both player positions and fixed seeds.
 
-* Plants carrots instead of wheat.
-* Adjusts seed purchasing to carrot economics.
-* Uses a carrot-specific selling threshold.
-* Retains the multi-worker assignment, hiring, and land-expansion framework.
+```bash
+python behavior_check.py --original /path/to/dynamic_all_agent_v1.py
+```
 
-### `dynamic_crop_agent_v0`
+The refactor should not be treated as fully behavior-verified until that real
+environment check passes.
 
-Introduces dynamic crop selection and becomes the current baseline.
+## Deliberately deferred behavioral change
 
-* Chooses among supported crops using expected **profit per day** based on current market price, seed cost, expected unfertilized yield, and time to maximum yield.
-* Avoids crops that cannot mature before the episode ends.
-* Adds a day-0 restriction to avoid immediately committing to slow-growing melons.
-* Adds `critical_water` as a higher-priority task for crops that have already gone unwatered.
-* Gives a worker standing directly on a critical watering task an immediate local override.
-* Harvests based on expected unfertilized yield.
-* Stops assigning new planting tasks late in the day.
-* Tracks escalating daily hire costs when deciding how many hands to hire.
-* Buys seeds for the currently selected crop.
-* Sells inventory across crop types when prices are acceptable or shed capacity is exhausted.
-* Keeps a cash buffer before buying additional land.
+The game processes at most 10 market orders per player per turn. The existing
+baseline can emit more than 10, after which the environment silently drops the
+rest. This refactor preserves that behavior so architecture and strategy are
+not changed simultaneously.
 
-### `dynamic_crop_agent_v1` — in development
+The first follow-up change should make market-order priority explicit and cap
+orders at 10, then evaluate that change independently.
 
-Focus: **task allocation**.
+## Submission
 
-The current allocator is sequential and greedy: workers are considered one at a time, and each worker takes the highest-priority nearest remaining task. This makes the result dependent on worker ordering and can send one worker to a task that another worker could complete much more efficiently.
+`main.py` remains the competition entry point. A multi-file Kaggle submission
+can include `main.py`, `runner.py`, `agent_framework/`, and `policies/` at the
+archive root.
 
-The goal of `dynamic_crop_agent_v1` is to make assignment decisions across workers and tasks more coherently while preserving the existing task strategy.
+## Evaluation pipeline
 
-Primary objectives:
-
-* Reduce unnecessary worker travel.
-* Avoid assignments where an early worker consumes a task that is much better positioned for a later worker.
-* Preserve urgent watering behavior.
-* Preserve the one-worker-per-tile constraint.
-* Preserve seed reservation for planting tasks.
-* Keep task allocation separate from task desirability and crop-selection strategy so allocation changes can be evaluated independently.
-
-## Current Strategy
-
-The current baseline is `dynamic_crop_agent_v0`.
-
-Its behavior includes:
-
-* Dynamically selecting a crop to plant using current crop economics.
-* Planting on available land.
-* Prioritizing crops at risk from missed watering.
-* Watering crops to preserve them and maintain yield.
-* Harvesting at expected unfertilized maximum yield.
-* Clearing weeds.
-* Hiring multiple farm hands while accounting for escalating hire cost.
-* Reserving seeds during task assignment.
-* Selling harvested crops when market prices are acceptable.
-* Expanding the farm when existing unlocked land becomes sufficiently occupied and sufficient cash remains.
-
-## Evaluation
-
-Agents are evaluated locally across fixed random seeds and from both player positions.
-
-Tracked metrics currently include:
-
-* Win rate
-* Mean final cash
-* Mean margin versus the baseline agent
-* Standard deviation of margin
-* Watering deaths
-* Natural crop decay
-
-Changes are generally tested independently so their effect on performance can be measured before additional strategy is added.
-
-## Current Work
-
-The next iteration is **`dynamic_crop_agent_v1`**, focused specifically on improving worker-to-task allocation.
-
-This iteration is intended to address allocation inefficiency without simultaneously changing crop selection, market policy, or the underlying definition and priority of tasks. That keeps the experiment interpretable: performance changes can be attributed primarily to the allocation strategy.
-
-Later improvements may include market-price forecasting, fertilizer, animals, more sophisticated land-expansion decisions, and learned decision components.
+The project now includes the structured evaluation pipeline under `evaluation_pipeline/` plus a notebook-compatible `metrics.py` facade. See `EVALUATION_README.md` for usage and metric definitions.
