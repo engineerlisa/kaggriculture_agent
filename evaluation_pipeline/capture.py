@@ -56,6 +56,27 @@ def _run_match(args: tuple[Any, ...]) -> dict[str, Any]:
     )
     env.run(agents)
     episode = env.toJSON()
+
+    final_statuses = [
+    player.get("status")
+    for player in episode["steps"][-1]
+]
+
+    if any(status != "DONE" for status in final_statuses):
+        details = [
+            {
+                "player": i,
+                "status": player.get("status"),
+                "info": player.get("info"),
+                "reward": player.get("reward"),
+            }
+            for i, player in enumerate(episode["steps"][-1])
+        ]
+        raise RuntimeError(
+            f"Kaggriculture match ended with agent failure: {details}"
+        )
+
+
     resolved_seed = episode.get("info", {}).get("seed")
     if resolved_seed != requested_seed:
         raise RuntimeError(f"Seed mismatch: requested {requested_seed}, "
