@@ -31,6 +31,7 @@ from agent_framework.core import (
     pending_animal,
     pending_animal_count,
     projected_end_of_day_overflow,
+    worker_inventory
 )
 
 
@@ -52,11 +53,11 @@ TASK_PRIORITY = {
     "harvest_animal": 1,
     "harvest": 1,
     "place_animal": 1,
+    "pickup_animal": 1,
     "feed": 2,
     "water": 2,
     "care": 3,
-    "collect_fertilizer": 3,
-    "pickup_animal": 3,
+    "collect_fertilizer": 3,    
     "build_structure": 3,
     "plant": 4,
     "weed": 5,
@@ -600,18 +601,93 @@ def _task_is_desirable(ctx, task):
 
     return True
 
+def _worker_carried_animal(ctx, worker_index):
+    inventory = worker_inventory(ctx, worker_index)
+
+    return next(
+        (
+            animal
+            for animal in ANIMALS
+            if inventory.get(animal, 0) > 0
+        ),
+        None,
+    )
+
+
+def _can_complete_animal_delivery(ctx, worker_position, task):
+    structure = empty_animal_structure(ctx, task.animal)
+    if structure is None:
+        return False
+
+    worker_x, worker_y = worker_position
+    structure_x, structure_y = structure
+
+    steps_required = (
+        distance(
+            worker_x,
+            worker_y,
+            task.x,
+            task.y,
+        )
+        + 1  # PICKUP
+        + distance(
+            task.x,
+            task.y,
+            structure_x,
+            structure_y,
+        )
+        + 1  # PLACE
+    )
+
+    steps_remaining = 24 - ctx.hour
+    return steps_required <= steps_remaining
+
 
 def rank_task(ctx, worker_index, worker_position, task):
     """Return baseline ordering for a worker/task pair, or None to reject it."""
-    del worker_index  # Included for learned policies that need worker identity.
-
     if not _task_is_desirable(ctx, task):
         return None
 
+    carried_animal = _worker_carried_animal(ctx, worker_index)
+
+    # Once a worker picks up an animal, completing that delivery becomes
+    # the worker's exclusive assignment.
+    if carried_animal is not None:
+        if (
+            task.type != "place_animal"
+            or task.animal != carried_animal
+        ):
+            return None
+
+    # Do not start a delivery that cannot be finished before workers reset.
+    if (
+        task.type == "pickup_animal"
+        and not _can_complete_animal_delivery(
+            ctx,
+            worker_position,
+            task,
+        )
+    ):
+        return None
+
     worker_x, worker_y = worker_position
+
+    # Animal delivery wins ties against other priority-1 work.
+    delivery_order = (
+        0
+        if task.type in ("pickup_animal", "place_animal")
+        else 1
+    )
+
     return (
         TASK_PRIORITY[task.type],
-        distance(worker_x, worker_y, task.x, task.y),
+        delivery_order,
+        distance(
+            worker_x,
+            worker_y,
+            task.x,
+            task.y,
+        ),
     )
 
 

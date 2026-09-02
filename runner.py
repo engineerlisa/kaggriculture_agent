@@ -5,13 +5,9 @@ from agent_framework import (
     execute_assignments,
     generate_candidate_tasks,
 )
-from policies import heuristic_v1
 
 
-DEFAULT_POLICY = heuristic_v1
-
-
-def run_agent(obs, policy=DEFAULT_POLICY):
+def run_agent(obs, policy):
     """Run one turn with a swappable decision policy.
 
     Required policy functions:
