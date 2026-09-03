@@ -1,6 +1,6 @@
 from agent_framework import (
     Plan,
-    assign_tasks,
+    assign_tasks as default_assign_tasks,
     build_context,
     execute_assignments,
     generate_candidate_tasks,
@@ -28,7 +28,12 @@ def run_agent(obs, policy):
     )
 
     tasks = generate_candidate_tasks(ctx, plan)
-    assignments = assign_tasks(ctx, tasks, policy.rank_task)
+    custom_assign_tasks = getattr(policy, "assign_tasks", None)
+
+    if custom_assign_tasks is not None:
+        assignments = custom_assign_tasks(ctx, tasks)
+    else:
+        assignments = default_assign_tasks(ctx, tasks, policy.rank_task)
     farmer_action, hand_actions = execute_assignments(ctx, assignments)
 
     return {

@@ -92,62 +92,31 @@ def _group_top1_accuracy(scores, labels, groups, mask, movement=None):
 
 
 def _heuristic_scores(X, feature_names):
-    """Convert the frozen heuristic tuple into a score for offline comparison."""
+    """Frozen heuristic ordering. Groups already contain one priority tier."""
     idx = {name: i for i, name in enumerate(feature_names)}
     distance = X[:, idx["distance"]]
-
-    priorities = {
-        "deposit_product": 0,
-        "critical_feed": 0,
-        "critical_water": 0,
-        "pickup_wheat": 1,
-        "harvest_animal": 1,
-        "harvest": 1,
-        "place_animal": 1,
-        "pickup_animal": 1,
-        "feed": 2,
-        "water": 2,
-        "care": 3,
-        "collect_fertilizer": 3,
-        "build_structure": 3,
-        "plant": 4,
-        "weed": 5,
-    }
-    priority = np.zeros(len(X), dtype=np.float32)
     delivery = np.ones(len(X), dtype=np.float32)
-    for task_type, p in priorities.items():
+    for task_type in {"pickup_animal", "place_animal"}:
         is_type = X[:, idx[f"task__{task_type}"]] > 0.5
-        priority[is_type] = p
-        if task_type in {"pickup_animal", "place_animal"}:
-            delivery[is_type] = 0
-
-    # Higher is better, preserving lexicographic priority/delivery/distance.
-    return -(priority * 1000.0 + delivery * 100.0 + distance)
+        delivery[is_type] = 0
+    return -(delivery * 100.0 + distance)
 
 
-def _priority_gated_scores(model_scores, X, feature_names):
-    idx = {name: i for i, name in enumerate(feature_names)}
-    priorities = {
-        "deposit_product": 0,
-        "critical_feed": 0,
-        "critical_water": 0,
-        "pickup_wheat": 1,
-        "harvest_animal": 1,
-        "harvest": 1,
-        "place_animal": 1,
-        "pickup_animal": 1,
-        "feed": 2,
-        "water": 2,
-        "care": 3,
-        "collect_fertilizer": 3,
-        "build_structure": 3,
-        "plant": 4,
-        "weed": 5,
-    }
-    priority = np.zeros(len(X), dtype=np.float32)
-    for task_type, p in priorities.items():
-        priority[X[:, idx[f"task__{task_type}"]] > 0.5] = p
-    return -priority * 10.0 + model_scores
+def _params():
+    return dict(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        min_child_weight=5,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        n_jobs=4,
+        random_state=42,
+    )
 
 
 def main():
@@ -166,53 +135,38 @@ def main():
         raise ValueError(f"Validation episode {args.validation_episode} not found")
 
     weights, raw_agent_totals = _balance_experts(data["weight"], data["agent"], train)
-
-    model = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        min_child_weight=5,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        tree_method="hist",
-        n_jobs=4,
-        random_state=42,
-    )
+    model = XGBClassifier(**_params())
     model.fit(X[train], y[train], sample_weight=weights[train])
 
     scores = np.zeros(len(X), dtype=np.float32)
     scores[validation] = model.predict_proba(X[validation])[:, 1]
     heuristic = _heuristic_scores(X, feature_names)
-    gated = _priority_gated_scores(scores, X, feature_names)
 
     print(f"rows: {len(X):,}; train={train.sum():,}; validation={validation.sum():,}")
+    print(f"same-tier decisions: {len(np.unique(data['group'])):,}")
     print(f"features: {len(feature_names)}")
     print("raw training weight by expert:")
     for agent_id, total in raw_agent_totals.items():
         print(f"  {agent_names[agent_id]}: {total:.1f}")
     print(f"validation ROC AUC: {roc_auc_score(y[validation], scores[validation]):.4f}")
-    print(f"validation top-1, heuristic: {_group_top1_accuracy(heuristic, y, data['group'], validation):.4f}")
-    print(f"validation top-1, model free: {_group_top1_accuracy(scores, y, data['group'], validation):.4f}")
-    print(f"validation top-1, model within heuristic priority: {_group_top1_accuracy(gated, y, data['group'], validation):.4f}")
-    print(f"movement top-1, heuristic: {_group_top1_accuracy(heuristic, y, data['group'], validation, data['movement']):.4f}")
-    print(f"movement top-1, model free: {_group_top1_accuracy(scores, y, data['group'], validation, data['movement']):.4f}")
+    print(f"validation same-tier top-1, heuristic: {_group_top1_accuracy(heuristic, y, data['group'], validation):.4f}")
+    print(f"validation same-tier top-1, GBT: {_group_top1_accuracy(scores, y, data['group'], validation):.4f}")
+    print(f"movement same-tier top-1, heuristic: {_group_top1_accuracy(heuristic, y, data['group'], validation, data['movement']):.4f}")
+    print(f"movement same-tier top-1, GBT: {_group_top1_accuracy(scores, y, data['group'], validation, data['movement']):.4f}")
 
     importance = sorted(
         zip(feature_names, model.feature_importances_),
         key=lambda item: item[1],
         reverse=True,
-    )[:15]
+    )[:20]
     print("top features:")
     for name, value in importance:
         print(f"  {name}: {value:.4f}")
 
-    # Refit the deployable model on all replay rows after validation diagnostics.
+    # Refit deployable model on all rows after the episode-level diagnostic.
     all_mask = np.ones(len(X), dtype=bool)
     final_weights, _ = _balance_experts(data["weight"], data["agent"], all_mask)
-    final_model = XGBClassifier(**model.get_params())
+    final_model = XGBClassifier(**_params())
     final_model.fit(X, y, sample_weight=final_weights)
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,9 +176,11 @@ def main():
         "feature_names": feature_names,
         "experts": agent_names,
         "training_rows": int(len(X)),
-        "labeled_decisions": int(len(np.unique(data["group"]))),
+        "same_tier_decisions": int(len(np.unique(data["group"]))),
+        "movement_decisions": int(len(np.unique(data["group"][data["movement"] > 0]))),
         "validation_episode": int(args.validation_episode),
-        "ranking_mode": "model_free_with_hard_critical_tier",
+        "ranking_mode": "heuristic_priority_then_gbt_with_continuity",
+        "training_target": "expert target versus same-heuristic-priority alternatives",
     }, indent=2))
     print(f"saved model: {args.model_path}")
     print(f"saved metadata: {metadata_path}")

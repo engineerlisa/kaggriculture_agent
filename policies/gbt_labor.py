@@ -1,28 +1,45 @@
 """Gradient-boosted labor allocator on top of the frozen heuristic strategy.
 
-Only worker/task ranking is learned. Crop/animal selection, task generation,
-market behavior, task feasibility, resource reservation, and action execution
-remain identical to heuristic_v2.
+The heuristic owns task priority and every non-labor decision. The GBT ranks
+worker/task pairings only within a heuristic priority tier. v4 also exposes
+same-day assignment continuity to the model so it can learn not to abandon a
+trip merely because the relational geometry changed one turn later.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import numpy as np
 from xgboost import XGBClassifier
 
-from agent_framework import Plan, build_context, execute_assignments, generate_candidate_tasks
-from agent_framework.core import distance, worker_can_do_task
-from labor_ml.features import build_pair_records, feature_names
+from agent_framework.core import worker_can_do_task
+from labor_ml.features import (
+    build_pair_records,
+    feature_names,
+    task_family,
+    task_identity,
+)
 from policies import heuristic_v2 as baseline
+from runner import run_agent
 
 
 NAME = "gbt_labor"
 MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "labor_gbt.json"
-HARD_FIRST_TASKS = {"critical_water", "critical_feed", "deposit_product"}
-
 _MODEL = None
+_HISTORY = {
+    "player": None,
+    "day": None,
+    "last_step": None,
+    "workers": {},
+}
+
+# Reuse the frozen heuristic for every non-labor decision surface.
+select_crop = baseline.select_crop
+select_animal = baseline.select_animal
+is_terminal_liquidation = baseline.is_terminal_liquidation
+market_actions = baseline.market_actions
 
 
 def _model():
@@ -42,16 +59,92 @@ def _eligible(ctx, worker_index, worker_position, task):
     )
 
 
-def _assign_tasks(ctx, tasks):
+def _priority(task):
+    return baseline.TASK_PRIORITY[task.type]
+
+
+def _history_for_turn(ctx):
+    """Return prior same-day state, resetting across episodes and day rollover."""
+    global _HISTORY
+    step = int(ctx.obs.get("step", ctx.day * 24 + ctx.hour))
+    player = int(ctx.obs.get("player", 0))
+
+    new_episode = (
+        _HISTORY["last_step"] is None
+        or _HISTORY["player"] != player
+        or step <= _HISTORY["last_step"]
+    )
+    new_day = _HISTORY["day"] is not None and int(ctx.day) != _HISTORY["day"]
+
+    if new_episode or new_day:
+        _HISTORY = {
+            "player": player,
+            "day": int(ctx.day),
+            "last_step": None,
+            "workers": {},
+        }
+
+    return _HISTORY["workers"]
+
+
+def _store_history(ctx, workers, assignments):
+    global _HISTORY
+    previous_workers = _HISTORY.get("workers", {})
+    next_workers = {}
+
+    for worker_index, worker_position in enumerate(workers):
+        task = assignments[worker_index] if worker_index < len(assignments) else None
+        previous = previous_workers.get(worker_index)
+
+        if task is None:
+            next_workers[worker_index] = {
+                "position": tuple(worker_position),
+                "target": None,
+                "family": None,
+                "target_xy": None,
+                "commitment_turns": 0,
+            }
+            continue
+
+        identity = task_identity(task)
+        if previous and previous.get("target") == identity:
+            commitment = int(previous.get("commitment_turns", 0)) + 1
+        else:
+            commitment = 1
+
+        next_workers[worker_index] = {
+            "position": tuple(worker_position),
+            "target": identity,
+            "family": task_family(task),
+            "target_xy": (task.x, task.y),
+            "commitment_turns": commitment,
+        }
+
+    _HISTORY = {
+        "player": int(ctx.obs.get("player", 0)),
+        "day": int(ctx.day),
+        "last_step": int(ctx.obs.get("step", ctx.day * 24 + ctx.hour)),
+        "workers": next_workers,
+    }
+
+
+def assign_tasks(ctx, tasks):
+    """Rank worker/task pairings within frozen heuristic task-priority tiers."""
     workers = [ctx.me["farmer"], *ctx.me["hands"]]
+    worker_history = _history_for_turn(ctx)
+
     pair_records = build_pair_records(
         ctx,
         tasks,
         lambda wi, pos, task: _eligible(ctx, wi, pos, task),
+        task_priority=_priority,
+        worker_history=worker_history,
     )
 
     if not pair_records:
-        return [None] * len(workers)
+        assignments = [None] * len(workers)
+        _store_history(ctx, workers, assignments)
+        return assignments
 
     names = feature_names()
     X = np.asarray(
@@ -64,7 +157,6 @@ def _assign_tasks(ctx, tasks):
     for record, score in zip(pair_records, scores):
         task = tasks[record.task_index]
         worker_position = tuple(workers[record.worker_index])
-        hard_tier = 0 if task.type in HARD_FIRST_TASKS else 1
         fallback_rank = baseline.rank_task(
             ctx,
             record.worker_index,
@@ -73,7 +165,7 @@ def _assign_tasks(ctx, tasks):
         )
         candidates.append(
             (
-                hard_tier,
+                _priority(task),
                 -float(score),
                 fallback_rank,
                 record.worker_index,
@@ -104,26 +196,9 @@ def _assign_tasks(ctx, tasks):
         if task.type != "deposit_product":
             assigned_tiles.add((task.x, task.y))
 
+    _store_history(ctx, workers, assignments)
     return assignments
 
 
 def agent(obs):
-    ctx = build_context(obs)
-
-    crop_to_plant = baseline.select_crop(ctx)
-    animal_to_add = baseline.select_animal(ctx, crop_to_plant)
-    plan = Plan(
-        crop_to_plant=crop_to_plant,
-        animal_to_add=animal_to_add,
-        terminal_liquidation=baseline.is_terminal_liquidation(ctx),
-    )
-
-    tasks = generate_candidate_tasks(ctx, plan)
-    assignments = _assign_tasks(ctx, tasks)
-    farmer_action, hand_actions = execute_assignments(ctx, assignments)
-
-    return {
-        "farmer": farmer_action,
-        "hands": hand_actions,
-        "market": baseline.market_actions(ctx, plan, assignments),
-    }
+    return run_agent(obs, sys.modules[__name__])

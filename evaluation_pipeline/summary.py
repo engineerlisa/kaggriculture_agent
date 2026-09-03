@@ -5,6 +5,7 @@ from typing import Iterable, Optional
 import math
 
 import pandas as pd
+from scipy.stats import t
 
 DEFAULT_SUMMARY_METRICS = ["final_cash",
                            "margin",
@@ -135,7 +136,7 @@ def build_summary(episodes: pd.DataFrame,
 
         paired = (
             episodes[episodes["agent"].isin([test_agent, baseline_agent])][
-                ["match_id", "agent", metric]
+                ["requested_seed", "match_id", "agent", metric]
             ].copy()
             if compare_to_baseline
             else pd.DataFrame()
@@ -148,29 +149,58 @@ def build_summary(episodes: pd.DataFrame,
         improved_rate = math.nan
 
         if not paired.empty:
-            wide = paired.pivot_table(index="match_id",
-                                      columns="agent",
-                                      values=metric,
-                                      aggfunc="first")
+            wide = paired.pivot_table(
+                index=["requested_seed", "match_id"],
+                columns="agent",
+                values=metric,
+                aggfunc="first",
+            )
 
             if test_agent in wide.columns and baseline_agent in wide.columns:
-                deltas = (
-                    pd.to_numeric(wide[test_agent], errors="coerce")
-                    - pd.to_numeric(wide[baseline_agent], errors="coerce")
+                match_deltas = (
+                        pd.to_numeric(wide[test_agent], errors="coerce")
+                        - pd.to_numeric(wide[baseline_agent], errors="coerce")
                 ).dropna()
 
-                if not deltas.empty:
-                    paired_delta_mean = deltas.mean()
-                    paired_delta_std = deltas.std(ddof=1) if len(deltas) > 1 else 0.0
-                    se = paired_delta_std / math.sqrt(len(deltas)) if len(deltas) > 1 else 0.0
+                # Each seed has two games:
+                # test as P0 and test as P1.
+                # Average those first so the seed is the independent unit.
+                grouped = match_deltas.groupby(level="requested_seed")
 
-                    paired_ci_low = paired_delta_mean - 1.96 * se
-                    paired_ci_high = paired_delta_mean + 1.96 * se
+                seed_deltas = grouped.mean()
+                games_per_seed = grouped.size()
+
+                # Only use complete two-game seed pairs.
+                seed_deltas = seed_deltas[games_per_seed == 2]
+
+                if not seed_deltas.empty:
+                    paired_delta_mean = seed_deltas.mean()
+                    paired_delta_std = (
+                        seed_deltas.std(ddof=1)
+                        if len(seed_deltas) > 1
+                        else 0.0
+                    )
+
+                    if len(seed_deltas) > 1:
+                        se = paired_delta_std / math.sqrt(len(seed_deltas))
+
+                        # t interval rather than 1.96 because the number
+                        # of independent seeds is relatively small.
+                        critical = t.ppf(
+                            0.975,
+                            df=len(seed_deltas) - 1,
+                        )
+
+                        paired_ci_low = paired_delta_mean - critical * se
+                        paired_ci_high = paired_delta_mean + critical * se
+                    else:
+                        paired_ci_low = paired_delta_mean
+                        paired_ci_high = paired_delta_mean
 
                     if direction == "higher":
-                        improved_rate = (deltas > 0).mean()
+                        improved_rate = (seed_deltas > 0).mean()
                     elif direction == "lower":
-                        improved_rate = (deltas < 0).mean()
+                        improved_rate = (seed_deltas < 0).mean()
 
         rows.append({"metric": metric,
                      "direction": direction,

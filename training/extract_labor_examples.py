@@ -4,21 +4,19 @@ import argparse
 import csv
 import gzip
 import json
-
-import numpy as np
-
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
+import numpy as np
 from kaggle_environments.envs.kaggriculture.kaggriculture import ANIMALS
 
 from agent_framework import Plan, build_context, generate_candidate_tasks
 from agent_framework.core import worker_can_do_task
-from labor_ml.features import build_pair_records, feature_names
+from labor_ml.features import build_pair_records, feature_names, task_family, task_identity
 from policies import heuristic_v2 as baseline
 
 
-EXPERTS = {"Whyme Labs", "Yuan800", "Crop Dusta"}
+DEFAULT_EXPERTS = {"Whyme Labs", "Yuan800", "Crop Dusta"}
 MOVES = {"NORTH", "SOUTH", "EAST", "WEST"}
 SUPPORTED_ENDPOINTS = {
     "PLANT", "WATER", "HARVEST", "BUILD_COOP", "BUILD_PASTURE", "DIG",
@@ -35,25 +33,13 @@ def _worker_actions(action_dict: dict) -> list[list]:
     return [action_dict.get("farmer", ["PASS"]), *action_dict.get("hands", [])]
 
 
-def _action_for_worker(steps, result_index: int, player: int, worker_index: int):
-    action_dict = steps[result_index][player].get("action") or {}
-    actions = _worker_actions(action_dict)
-    return actions[worker_index] if worker_index < len(actions) else ["PASS"]
-
-
 def _decision_obs(steps, result_index: int, player: int) -> dict:
     return steps[result_index - 1][player]["observation"]
 
 
 def _precompute_endpoints(steps, player: int):
-    """High-confidence intent labels for every (result_index, worker_index).
-
-    Backward propagation makes this O(worker-turns), not O(worker-turns *
-    remaining episode length). A movement inherits the next turn's endpoint
-    only when it moves exactly one Manhattan step closer to that endpoint.
-    """
+    """High-confidence intent labels propagated backward along direct movement."""
     intents = {}
-
     for result_index in range(len(steps) - 1, 0, -1):
         obs = _decision_obs(steps, result_index, player)
         day = int(obs["day"])
@@ -99,7 +85,6 @@ def _precompute_endpoints(steps, player: int):
                 **next_intent,
                 "movement_steps": next_intent["movement_steps"] + 1,
             }
-
     return intents
 
 
@@ -143,7 +128,6 @@ def _task_matches_endpoint(task, endpoint, endpoint_obs: dict, player: int) -> b
         if item in ANIMALS:
             return task.type == "place_animal" and task.animal == item
         return task.type == "deposit_product" and task.item == item
-
     return False
 
 
@@ -164,7 +148,11 @@ def _eligible(ctx, worker_index, worker_position, task) -> bool:
     )
 
 
-def extract_episode(path: Path, row_sink=None):
+def _priority(task) -> int:
+    return baseline.TASK_PRIORITY[task.type]
+
+
+def extract_episode(path: Path, experts: set[str], row_sink=None):
     episode = json.loads(path.read_text())
     steps = episode["steps"]
     names = episode.get("info", {}).get("TeamNames", [])
@@ -175,14 +163,20 @@ def extract_episode(path: Path, row_sink=None):
     agent_decisions = Counter()
 
     for player, agent_name in enumerate(names):
-        if agent_name not in EXPERTS:
+        if agent_name not in experts:
             continue
 
         endpoints = _precompute_endpoints(steps, player)
+        history_by_worker: dict[int, dict] = {}
+        history_day = None
 
         for result_index in range(1, len(steps)):
             decision_obs = _decision_obs(steps, result_index, player)
             ctx = build_context(decision_obs)
+            if history_day is None or ctx.day != history_day:
+                history_by_worker = {}
+                history_day = ctx.day
+
             plan = _build_plan(ctx)
             tasks = generate_candidate_tasks(ctx, plan)
             workers = _workers(decision_obs, player)
@@ -199,13 +193,10 @@ def extract_episode(path: Path, row_sink=None):
                 endpoint_obs = _decision_obs(steps, endpoint["result_index"], player)
                 eligible_task_indices = []
                 matching_task_indices = []
-                ranked = []
                 for task_index, task in enumerate(tasks):
                     if not _eligible(ctx, worker_index, tuple(worker_position), task):
                         continue
-                    rank = baseline.rank_task(ctx, worker_index, tuple(worker_position), task)
                     eligible_task_indices.append(task_index)
-                    ranked.append((rank, task_index))
                     if _task_matches_endpoint(task, endpoint, endpoint_obs, player):
                         matching_task_indices.append(task_index)
 
@@ -218,95 +209,124 @@ def extract_episode(path: Path, row_sink=None):
 
                 positive_task_index = matching_task_indices[0]
                 positive_task = tasks[positive_task_index]
-                negatives = [ti for ti in eligible_task_indices if ti != positive_task_index]
+                positive_priority = _priority(positive_task)
 
-                # Keep hard negatives instead of materializing dozens of nearly
-                # equivalent easy rows for every worker decision.
-                selected_negatives = []
-                seen = set()
-                def add_candidates(indices):
-                    for ti in indices:
-                        if ti == positive_task_index or ti in seen:
-                            continue
-                        seen.add(ti)
-                        selected_negatives.append(ti)
-                        if len(selected_negatives) >= 16:
-                            return True
-                    return False
+                # v4 learns only the decision surface it controls at deployment:
+                # alternatives in the SAME heuristic priority tier.
+                negatives = [
+                    ti for ti in eligible_task_indices
+                    if ti != positive_task_index and _priority(tasks[ti]) == positive_priority
+                ]
+                if not negatives:
+                    stats["no_same_priority_alternative"] += 1
+                    continue
 
-                add_candidates([ti for _, ti in sorted(ranked)])
-                if len(selected_negatives) < 16:
-                    same_type = sorted(
-                        (abs(worker_position[0] - tasks[ti].x) + abs(worker_position[1] - tasks[ti].y), ti)
-                        for ti in negatives
-                        if tasks[ti].type == positive_task.type
-                    )
-                    add_candidates([ti for _, ti in same_type])
-                if len(selected_negatives) < 16:
-                    add_candidates(negatives)
-
-                selected = [positive_task_index, *selected_negatives[:16]]
+                # Up to 16 nearest same-tier hard negatives. Global task priority
+                # is intentionally absent from the learned comparison.
+                negatives.sort(key=lambda ti: (
+                    abs(worker_position[0] - tasks[ti].x) + abs(worker_position[1] - tasks[ti].y),
+                    tasks[ti].type,
+                    tasks[ti].x,
+                    tasks[ti].y,
+                ))
+                selected = [positive_task_index, *negatives[:16]]
                 selected_by_worker[worker_index] = selected
                 positive_task_by_worker[worker_index] = (positive_task_index, endpoint)
                 agent_decisions[agent_name] += 1
                 stats["labeled_decisions"] += 1
                 stats["movement_labeled_decisions"] += int(endpoint["movement_steps"] > 0)
+                stats[f"priority_{positive_priority}_decisions"] += 1
 
             emit_pairs = {
                 (worker_index, task_index)
                 for worker_index, task_indices in selected_by_worker.items()
                 for task_index in task_indices
             }
-            if not emit_pairs:
-                continue
 
-            pair_records = build_pair_records(
-                ctx, tasks,
-                lambda wi, pos, task: _eligible(ctx, wi, pos, task),
-                emit_pairs=emit_pairs,
-            )
+            if emit_pairs:
+                pair_records = build_pair_records(
+                    ctx,
+                    tasks,
+                    lambda wi, pos, task: _eligible(ctx, wi, pos, task),
+                    emit_pairs=emit_pairs,
+                    task_priority=_priority,
+                    worker_history=history_by_worker,
+                )
 
-            for record in pair_records:
-                worker_index = record.worker_index
-                positive_task_index, endpoint = positive_task_by_worker[worker_index]
-                task = tasks[record.task_index]
-                negative_count = max(1, len(selected_by_worker[worker_index]) - 1)
-                is_positive = int(record.task_index == positive_task_index)
-                row = {
-                    "episode_id": episode_id,
-                    "agent": agent_name,
-                    "player": player,
-                    "result_index": result_index,
-                    "day": int(ctx.day),
-                    "hour": int(ctx.hour),
-                    "worker_index": worker_index,
-                    "decision_id": f"{episode_id}:{player}:{result_index}:{worker_index}",
-                    "target_task_type": tasks[positive_task_index].type,
-                    "candidate_task_type": task.type,
-                    "candidate_x": task.x,
-                    "candidate_y": task.y,
-                    "movement_target": int(endpoint["movement_steps"] > 0),
-                    "row_weight": 1.0 if is_positive else 1.0 / negative_count,
-                    "label": is_positive,
-                    **record.features,
-                }
-                if row_sink is None:
-                    rows.append(row)
+                for record in pair_records:
+                    worker_index = record.worker_index
+                    positive_task_index, endpoint = positive_task_by_worker[worker_index]
+                    task = tasks[record.task_index]
+                    negative_count = max(1, len(selected_by_worker[worker_index]) - 1)
+                    is_positive = int(record.task_index == positive_task_index)
+                    row = {
+                        "episode_id": episode_id,
+                        "agent": agent_name,
+                        "player": player,
+                        "result_index": result_index,
+                        "day": int(ctx.day),
+                        "hour": int(ctx.hour),
+                        "worker_index": worker_index,
+                        "decision_id": f"{episode_id}:{player}:{result_index}:{worker_index}",
+                        "target_task_type": tasks[positive_task_index].type,
+                        "candidate_task_type": task.type,
+                        "candidate_x": task.x,
+                        "candidate_y": task.y,
+                        "movement_target": int(endpoint["movement_steps"] > 0),
+                        "row_weight": 1.0 if is_positive else 1.0 / negative_count,
+                        "label": is_positive,
+                        **record.features,
+                    }
+                    if row_sink is None:
+                        rows.append(row)
+                    else:
+                        row_sink(row)
+
+            # Build the temporal state for the NEXT turn. Use only targets that
+            # were expressible in our candidate vocabulary; otherwise clear the
+            # assignment rather than inventing intent.
+            next_history = {}
+            for worker_index, worker_position in enumerate(workers):
+                previous = history_by_worker.get(worker_index)
+                target_info = positive_task_by_worker.get(worker_index)
+                if target_info is None:
+                    next_history[worker_index] = {
+                        "position": tuple(worker_position),
+                        "target": None,
+                        "family": None,
+                        "target_xy": None,
+                        "commitment_turns": 0,
+                    }
+                    continue
+
+                positive_task = tasks[target_info[0]]
+                identity = task_identity(positive_task)
+                if previous and previous.get("target") == identity:
+                    commitment = int(previous.get("commitment_turns", 0)) + 1
                 else:
-                    row_sink(row)
+                    commitment = 1
+                next_history[worker_index] = {
+                    "position": tuple(worker_position),
+                    "target": identity,
+                    "family": task_family(positive_task),
+                    "target_xy": (positive_task.x, positive_task.y),
+                    "commitment_turns": commitment,
+                }
+            history_by_worker = next_history
 
     return (rows or []), stats, agent_decisions
 
 
 class _NpzSink:
-    def __init__(self):
+    def __init__(self, experts: set[str]):
         self.names = feature_names()
+        self.experts = sorted(experts)
         self.buffers = {name: [] for name in (
             "X", "y", "weight", "episode", "agent", "group", "movement"
         )}
         self.chunks = {name: [] for name in self.buffers}
         self.group_ids = {}
-        self.agent_ids = {name: i for i, name in enumerate(sorted(EXPERTS))}
+        self.agent_ids = {name: i for i, name in enumerate(self.experts)}
         self.row_count = 0
         self.chunk_size = 4096
 
@@ -347,7 +367,7 @@ class _NpzSink:
             path,
             **arrays,
             feature_names=np.asarray(self.names),
-            agent_names=np.asarray(sorted(EXPERTS)),
+            agent_names=np.asarray(self.experts),
         )
 
 
@@ -355,19 +375,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("replay_dir", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--experts",
+        type=str,
+        default=",".join(sorted(DEFAULT_EXPERTS)),
+        help="Comma-separated agent names to imitate.",
+    )
     args = parser.parse_args()
+    experts = {name.strip() for name in args.experts.split(",") if name.strip()}
 
     total_stats = Counter()
     total_agent_decisions = Counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     if args.output.suffix == ".npz":
-        sink = _NpzSink()
+        sink = _NpzSink(experts)
         for path in sorted(args.replay_dir.glob("*.json")):
-            _, stats, agent_decisions = extract_episode(path, row_sink=sink)
+            _, stats, agent_decisions = extract_episode(path, experts, row_sink=sink)
             total_stats.update(stats)
             total_agent_decisions.update(agent_decisions)
-            print(path.name, dict(stats), flush=True)
+            if stats["worker_decisions"]:
+                print(path.name, dict(stats), flush=True)
         if sink.row_count == 0:
             raise RuntimeError("No labeled training rows were extracted.")
         sink.save(args.output)
@@ -386,10 +414,9 @@ def main():
                 row_count += 1
 
             for path in sorted(args.replay_dir.glob("*.json")):
-                _, stats, agent_decisions = extract_episode(path, row_sink=write_row)
+                _, stats, agent_decisions = extract_episode(path, experts, row_sink=write_row)
                 total_stats.update(stats)
                 total_agent_decisions.update(agent_decisions)
-                print(path.name, dict(stats), flush=True)
 
     print(f"wrote {row_count:,} pair rows to {args.output}")
     print("totals", dict(total_stats))

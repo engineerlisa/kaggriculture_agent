@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import ANIMALS, CROPS
 
@@ -37,6 +37,26 @@ class PairRecord:
     features: dict[str, float]
 
 
+def task_family(task) -> str:
+    if task.type in {"water", "critical_water"}:
+        return "water"
+    if task.type in {"feed", "critical_feed"}:
+        return "feed"
+    return task.type
+
+
+def task_identity(task) -> tuple:
+    """Stable target identity across urgency transitions such as water -> critical_water."""
+    return (
+        task_family(task),
+        int(task.x),
+        int(task.y),
+        task.crop,
+        task.animal,
+        task.item,
+    )
+
+
 def _tile_features(ctx, task) -> dict[str, float]:
     tile = task.tile if isinstance(task.tile, dict) else {}
     crop = task.crop
@@ -67,16 +87,83 @@ def _tile_features(ctx, task) -> dict[str, float]:
     }
 
 
+def _history_features(worker_position, task, history) -> dict[str, float]:
+    if not history:
+        return {
+            "has_previous_assignment": 0.0,
+            "same_as_previous_target": 0.0,
+            "same_tile_as_previous_target": 0.0,
+            "same_task_family_as_previous_target": 0.0,
+            "previous_commitment_turns": 0.0,
+            "progress_since_previous_turn": 0.0,
+            "last_move_toward_candidate": 0.0,
+            "last_move_away_from_candidate": 0.0,
+            "distance_to_previous_target": 20.0,
+            "candidate_distance_minus_previous_target": 0.0,
+        }
+
+    previous_position = history.get("position")
+    previous_target = history.get("target")
+    previous_family = history.get("family")
+    previous_xy = history.get("target_xy")
+
+    pair_distance = distance(worker_position[0], worker_position[1], task.x, task.y)
+    progress = 0.0
+    if previous_position is not None:
+        previous_candidate_distance = distance(
+            previous_position[0], previous_position[1], task.x, task.y
+        )
+        progress = float(previous_candidate_distance - pair_distance)
+
+    has_previous = previous_target is not None
+    same_target = has_previous and task_identity(task) == previous_target
+    same_tile = has_previous and previous_xy == (task.x, task.y)
+    same_family = has_previous and previous_family == task_family(task)
+
+    if previous_xy is not None:
+        previous_target_distance = distance(
+            worker_position[0], worker_position[1], previous_xy[0], previous_xy[1]
+        )
+    else:
+        previous_target_distance = 20
+
+    return {
+        "has_previous_assignment": float(has_previous),
+        "same_as_previous_target": float(same_target),
+        "same_tile_as_previous_target": float(same_tile),
+        "same_task_family_as_previous_target": float(same_family),
+        "previous_commitment_turns": float(history.get("commitment_turns", 0) or 0),
+        "progress_since_previous_turn": progress,
+        "last_move_toward_candidate": float(progress > 0),
+        "last_move_away_from_candidate": float(progress < 0),
+        "distance_to_previous_target": float(previous_target_distance),
+        "candidate_distance_minus_previous_target": float(pair_distance - previous_target_distance),
+    }
+
+
 def build_pair_records(
     ctx,
     tasks,
     eligible: Callable[[int, tuple[int, int], object], bool],
     emit_pairs: set[tuple[int, int]] | None = None,
+    *,
+    task_priority: Callable[[object], int] | None = None,
+    worker_history: dict[int, dict] | None = None,
 ) -> list[PairRecord]:
-    """Build one feature row for every currently eligible worker/task pair."""
+    """Build feature rows for eligible worker/task pairs.
+
+    Worker-side comparative geometry is computed within the candidate task's
+    heuristic priority tier, matching deployment where the GBT can rank only
+    inside a tier. Temporal features describe the worker's previous assignment
+    and movement during the same day.
+    """
     workers = [ctx.me["farmer"], *ctx.me["hands"]]
     if not workers or not tasks:
         return []
+
+    if task_priority is None:
+        task_priority = lambda task: 0
+    worker_history = worker_history or {}
 
     distances = [
         [distance(wx, wy, task.x, task.y) for task in tasks]
@@ -85,6 +172,7 @@ def build_pair_records(
 
     eligible_pairs: list[tuple[int, int]] = []
     by_worker: dict[int, list[int]] = defaultdict(list)
+    by_worker_priority: dict[tuple[int, int], list[int]] = defaultdict(list)
     by_task: dict[int, list[int]] = defaultdict(list)
 
     for worker_index, worker_position in enumerate(workers):
@@ -94,14 +182,16 @@ def build_pair_records(
                 continue
             eligible_pairs.append((worker_index, task_index))
             by_worker[worker_index].append(task_index)
+            by_worker_priority[(worker_index, task_priority(task))].append(task_index)
             by_task[task_index].append(worker_index)
 
     if not eligible_pairs:
         return []
 
-    worker_sorted = {}
-    for worker_index, task_indices in by_worker.items():
-        worker_sorted[worker_index] = sorted(
+    worker_priority_sorted = {}
+    for key, task_indices in by_worker_priority.items():
+        worker_index, _ = key
+        worker_priority_sorted[key] = sorted(
             (distances[worker_index][task_index], task_index)
             for task_index in task_indices
         )
@@ -114,6 +204,10 @@ def build_pair_records(
         )
 
     task_type_counts = Counter(tasks[task_index].type for _, task_index in eligible_pairs)
+    priority_task_sets: dict[int, set[int]] = defaultdict(set)
+    for _, task_index in eligible_pairs:
+        priority_task_sets[task_priority(tasks[task_index])].add(task_index)
+
     critical_task_count = sum(
         task.type in {"critical_water", "critical_feed"}
         for task in tasks
@@ -125,7 +219,9 @@ def build_pair_records(
             continue
 
         worker_x, worker_y = workers[worker_index]
+        worker_position = (worker_x, worker_y)
         task = tasks[task_index]
+        priority = task_priority(task)
         pair_distance = distances[worker_index][task_index]
 
         sorted_workers = task_sorted[task_index]
@@ -137,7 +233,10 @@ def build_pair_records(
                 break
         num_workers_closer = sum(d < pair_distance for d, _ in sorted_workers)
 
-        sorted_tasks = worker_sorted[worker_index]
+        # These worker-side alternatives are deliberately restricted to the
+        # same heuristic priority tier, because lower/higher tiers cannot beat
+        # this task on GBT score at deployment.
+        sorted_tasks = worker_priority_sorted[(worker_index, priority)]
         best_task_distance = sorted_tasks[0][0]
         nearest_other_task_distance = pair_distance + 10
         for d, other_task_index in sorted_tasks:
@@ -167,6 +266,8 @@ def build_pair_records(
             "candidate_task_count": float(len(tasks)),
             "eligible_task_count_for_worker": float(len(by_worker[worker_index])),
             "eligible_worker_count_for_task": float(len(by_task[task_index])),
+            "eligible_same_priority_task_count_for_worker": float(len(sorted_tasks)),
+            "same_priority_task_count": float(len(priority_task_sets[priority])),
             "same_type_pair_count": float(task_type_counts[task.type]),
             "critical_task_count": float(critical_task_count),
             "task_amount": float(task.amount or 0),
@@ -174,6 +275,7 @@ def build_pair_records(
             "worker_fertilizer": float(inventory.get("FERTILIZER", 0)),
             "worker_inventory_units": float(total_inventory),
             "worker_carries_animal": float(carried_animal),
+            **_history_features(worker_position, task, worker_history.get(worker_index)),
             **_tile_features(ctx, task),
         }
 
@@ -190,8 +292,6 @@ def build_pair_records(
 
 
 def feature_names() -> list[str]:
-    # Construct a tiny synthetic ordering-free declaration that mirrors the
-    # insertion order in build_pair_records.
     base = [
         "distance", "on_task", "hours_remaining", "travel_action_slack",
         "worker_distance_to_shed", "task_distance_to_shed",
@@ -199,11 +299,18 @@ def feature_names() -> list[str]:
         "distance_from_best_worker", "nearest_other_task_distance",
         "distance_from_worker_best_task", "worker_count", "candidate_task_count",
         "eligible_task_count_for_worker", "eligible_worker_count_for_task",
+        "eligible_same_priority_task_count_for_worker", "same_priority_task_count",
         "same_type_pair_count", "critical_task_count", "task_amount",
         "worker_wheat", "worker_fertilizer", "worker_inventory_units",
-        "worker_carries_animal", "crop_age", "animal_age", "yield_units",
-        "watered_today", "consecutive_unwatered", "fertilized_days_remaining",
-        "fed_today", "consecutive_unfed", "cared_today", "pending_care_bonus",
+        "worker_carries_animal",
+        "has_previous_assignment", "same_as_previous_target",
+        "same_tile_as_previous_target", "same_task_family_as_previous_target",
+        "previous_commitment_turns", "progress_since_previous_turn",
+        "last_move_toward_candidate", "last_move_away_from_candidate",
+        "distance_to_previous_target", "candidate_distance_minus_previous_target",
+        "crop_age", "animal_age", "yield_units", "watered_today",
+        "consecutive_unwatered", "fertilized_days_remaining", "fed_today",
+        "consecutive_unfed", "cared_today", "pending_care_bonus",
         "fertilizer_available",
     ]
     return (

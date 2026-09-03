@@ -16,6 +16,8 @@
     "candidate_task_count",
     "eligible_task_count_for_worker",
     "eligible_worker_count_for_task",
+    "eligible_same_priority_task_count_for_worker",
+    "same_priority_task_count",
     "same_type_pair_count",
     "critical_task_count",
     "task_amount",
@@ -23,6 +25,16 @@
     "worker_fertilizer",
     "worker_inventory_units",
     "worker_carries_animal",
+    "has_previous_assignment",
+    "same_as_previous_target",
+    "same_tile_as_previous_target",
+    "same_task_family_as_previous_target",
+    "previous_commitment_turns",
+    "progress_since_previous_turn",
+    "last_move_toward_candidate",
+    "last_move_away_from_candidate",
+    "distance_to_previous_target",
+    "candidate_distance_minus_previous_target",
     "crop_age",
     "animal_age",
     "yield_units",
@@ -59,12 +71,23 @@
     "animal__SHEEP"
   ],
   "experts": [
+    "Atakan Aldemir",
+    "BOB",
     "Crop Dusta",
+    "Dmitry Larko",
+    "John Park",
+    "Milan Leonard",
+    "Mohammad Alnajdawi",
     "Whyme Labs",
-    "Yuan800"
+    "Yuan800",
+    "curiosity",
+    "icelemon2004",
+    "sbol ball"
   ],
-  "training_rows": 581640,
-  "labeled_decisions": 35270,
+  "training_rows": 1651530,
+  "same_tier_decisions": 127371,
+  "movement_decisions": 65620,
   "validation_episode": 104830155,
-  "ranking_mode": "model_free_with_hard_critical_tier"
+  "ranking_mode": "heuristic_priority_then_gbt_with_continuity",
+  "training_target": "expert target versus same-heuristic-priority alternatives"
 }
