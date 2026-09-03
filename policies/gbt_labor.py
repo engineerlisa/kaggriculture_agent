@@ -12,7 +12,12 @@ from pathlib import Path
 import sys
 
 import numpy as np
-from xgboost import XGBClassifier
+
+# Kaggle's sklearn installation is binary-incompatible with its NumPy.
+# XGBoost treats sklearn as optional, so prevent it from importing sklearn.
+sys.modules["sklearn"] = None       # pyright: ignore[reportArgumentType]
+
+from xgboost import Booster, DMatrix
 
 from agent_framework.core import worker_can_do_task
 from labor_ml.features import (
@@ -45,9 +50,9 @@ market_actions = baseline.market_actions
 def _model():
     global _MODEL
     if _MODEL is None:
-        model = XGBClassifier()
-        model.load_model(MODEL_PATH)
-        model.get_booster().set_param({"nthread": 1})
+        model = Booster()
+        model.load_model(str(MODEL_PATH))
+        model.set_param({"nthread": 1})
         _MODEL = model
     return _MODEL
 
@@ -151,7 +156,7 @@ def assign_tasks(ctx, tasks):
         [[record.features[name] for name in names] for record in pair_records],
         dtype=np.float32,
     )
-    scores = _model().predict_proba(X)[:, 1]
+    scores = _model().predict(DMatrix(X))
 
     candidates = []
     for record, score in zip(pair_records, scores):

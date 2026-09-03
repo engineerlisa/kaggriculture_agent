@@ -1,3 +1,3 @@
-from . import heuristic_v1
+from . import heuristic_v2
 
-__all__ = ["heuristic_v1"]
+__all__ = ["heuristic_v2"]

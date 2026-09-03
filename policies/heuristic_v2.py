@@ -52,8 +52,8 @@ TASK_PRIORITY = {
     "pickup_wheat": 1,
     "harvest_animal": 1,
     "harvest": 1,
-    "place_animal": 1,
-    "pickup_animal": 1,
+    "place_animal": 2,
+    "pickup_animal": 2,
     "feed": 2,
     "water": 2,
     "care": 3,
@@ -819,7 +819,7 @@ def market_actions(ctx, plan, assignments):
 
 
 def _append_hires(ctx, actions, money_available):
-    target_hires = 8
+    target_hires = 10
     hires_needed = (
         0
         if ctx.hour == 23
@@ -976,7 +976,7 @@ def _append_land_purchase(ctx, actions, money_available):
     land_cost = land_costs[extra_quadrants]
     if (
         land_occupied_percentage(ctx) > 80
-        and money_available >= land_cost * 1.6
+        and money_available >= land_cost * 2
         and ctx.day < 28
     ):
         actions.append(["BUY_LAND"])
